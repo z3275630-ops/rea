@@ -1,0 +1,136 @@
+name: Safe REA upstream sync
+
+on:
+  schedule:
+    # Every day at 11:17 Beijing time (03:17 UTC).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: safe-rea-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check and safely sync upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Check upstream, back up, and merge safely
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          alert() {
+            local reason="$1"
+            local run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            {
+              echo "## Upstream synchronization paused"
+              echo ""
+              echo "$reason"
+              echo ""
+              echo "Your main branch has NOT been updated."
+              echo "Run: $run_url"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$reason"
+            local issue_title="REA 上游自动同步暂停"
+            local issue_body
+            issue_body=$(printf '原因：%s\n\n此次没有更新 main 分支。\n\n工作流记录：%s\n' "$reason" "$run_url")
+            local existing_issue
+            existing_issue=$(gh issue list --state open --limit 100 --json number,title --jq '.[] | select(.title == "REA 上游自动同步暂停") | .number' | head -n 1) || true
+            if [[ -n "$existing_issue" ]]; then
+              gh issue comment "$existing_issue" --body "$issue_body" || true
+            else
+              gh issue create --title "$issue_title" --body "$issue_body" || true
+            fi
+            exit 1
+          }
+
+          git remote add upstream https://github.com/morluto/rea.git
+          if ! git fetch --no-tags upstream main; then
+            alert "Cannot fetch morluto/rea. The upstream repository may be deleted, private, or temporarily unavailable."
+          fi
+
+          upstream_sha=$(git rev-parse upstream/main)
+          # On the initial run, start with the last upstream commit that
+          # the fork was verified against when this workflow was installed.
+          last_upstream=$(git log --first-parent --format=%P --grep='^chore(sync): merge morluto/rea main$' -1 HEAD | awk '{print $2}')
+          if [[ -z "$last_upstream" ]]; then
+            last_upstream="e90acaea674f5f7f9f17ea472104afdc1422ada6"
+          fi
+
+          if ! git cat-file -e "$last_upstream^{commit}" 2>/dev/null; then
+            alert "Cannot locate the previously synced upstream commit. Manual review required."
+          fi
+          if ! git merge-base --is-ancestor "$last_upstream" upstream/main; then
+            alert "Upstream history was rewritten, or the expected upstream commit disappeared. Refusing to force-sync."
+          fi
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream ($upstream_sha)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          removed_files=$(git diff --name-only --diff-filter=DR "$last_upstream" upstream/main)
+          if [[ -n "$removed_files" ]]; then
+            alert "Upstream deleted or renamed tracked files. Manual review needed. First affected paths: $(echo "$removed_files" | head -n 5 | tr '\n' ' ')"
+          fi
+
+          sensitive_files=$(git diff --name-only "$last_upstream" upstream/main | grep -E '^\.github/(workflows/|actions/)' || true)
+          if [[ -n "$sensitive_files" ]]; then
+            alert "Upstream changed GitHub Actions code. Manual security review required before merging."
+          fi
+
+          removed_lines=$(git diff --numstat "$last_upstream" upstream/main | awk '$2 ~ /^[0-9]+$/ {s += $2} END {print s+0}')
+          files_changed=$(git diff --name-only "$last_upstream" upstream/main | wc -l | tr -d ' ')
+          if (( removed_lines > 350 || files_changed > 80 )); then
+            alert "Large upstream change: $removed_lines removed lines across $files_changed files. Manual review required."
+          fi
+
+          if ! git diff --check "$last_upstream" upstream/main; then
+            alert "Upstream contains whitespace/conflict marker errors. Manual review required."
+          fi
+
+          # Preserve our custom workflow by MERGING upstream instead of
+          # making main point straight at upstream/main.
+          if ! git merge --no-ff --no-edit -m "chore(sync): merge morluto/rea main" upstream/main; then
+            git merge --abort || true
+            alert "Git merge conflict. The fork's main branch is unchanged."
+          fi
+
+          # Back up the exact pre-sync fork commit before updating main.
+          before_merge=$(git rev-parse HEAD^1)
+          backup="backup/sync-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git branch "$backup" "$before_merge"
+          if ! git push origin "$backup"; then
+            alert "Could not create the pre-sync backup branch, so main was not updated."
+          fi
+
+          if ! git push origin HEAD:refs/heads/main; then
+            alert "Push of the merged branch failed. The pre-sync backup was retained."
+          fi
+
+          {
+            echo "## Safe upstream sync completed"
+            echo ""
+            echo "Upstream: $upstream_sha"
+            echo "Removed lines: $removed_lines; changed files: $files_changed"
+            echo "Backup: $backup"
+            echo "The custom sync workflow is preserved by the merge commit."
+          } >> "$GITHUB_STEP_SUMMARY"
