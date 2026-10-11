@@ -1,8 +1,10 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
+  # This fork mirrors upstream source code. Creating npm/MCP releases
+  # from every upstream sync is unnecessary and requires privileges
+  # that the fork's default GITHUB_TOKEN intentionally lacks.
+  # Preserve manual releases and PR-triggered release handling.
   pull_request:
     branches: [main]
     types: [closed]
