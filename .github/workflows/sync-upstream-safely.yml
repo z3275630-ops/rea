@@ -1,6 +1,11 @@
 name: Safe REA upstream sync
 
 on:
+  # Exercise updated sync logic automatically whenever this file changes.
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sync-upstream-safely.yml"
   schedule:
     # Every day at 11:17 Beijing time (03:17 UTC).
     - cron: "17 3 * * *"
