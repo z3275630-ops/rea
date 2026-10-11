@@ -75,6 +75,11 @@ jobs:
             echo "::error::Reverted code does not match the pre-sync tree. Refusing to push."
             exit 1
           fi
+          # A tracked freeze marker prevents repeatedly resyncing a
+          # rejected upstream version, even when GitHub Issues are disabled.
+          printf 'CI failed for upstream merge: %s\nReview before removing this marker.\n' "$failed_sha" > .rea-sync-frozen
+          git add .rea-sync-frozen
+          git commit -m "chore(sync): freeze after automatic CI rollback"
           auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
           git -c "http.https://github.com/.extraheader=$auth_header" push origin "$failed_backup"
           git -c "http.https://github.com/.extraheader=$auth_header" push origin HEAD:refs/heads/main
