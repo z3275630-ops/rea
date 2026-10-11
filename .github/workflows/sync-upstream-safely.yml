@@ -18,7 +18,7 @@ jobs:
   sync:
     name: Check and safely sync upstream
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
 
     steps:
       - name: Checkout fork
@@ -26,9 +26,10 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
-      - name: Check upstream, back up, and merge safely
+      - name: Review upstream changes and prepare local merge
+        id: inspect
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -83,6 +84,7 @@ jobs:
           fi
 
           if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Already up to date with upstream ($upstream_sha)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -114,23 +116,51 @@ jobs:
             alert "Git merge conflict. The fork's main branch is unchanged."
           fi
 
-          # Back up the exact pre-sync fork commit before updating main.
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Candidate merge prepared; tests must pass before publication." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Node.js for candidate validation
+        if: steps.inspect.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Verify merged code before publishing
+        if: steps.inspect.outputs.changed == 'true'
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check:fast
+          npm run test:fast
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Back up old version and publish verified merge
+        if: steps.inspect.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           before_merge=$(git rev-parse HEAD^1)
           backup="backup/sync-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           git branch "$backup" "$before_merge"
-          if ! git push origin "$backup"; then
-            alert "Could not create the pre-sync backup branch, so main was not updated."
-          fi
-
-          if ! git push origin HEAD:refs/heads/main; then
-            alert "Push of the merged branch failed. The pre-sync backup was retained."
-          fi
-
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
+          git -c "http.https://github.com/.extraheader=$auth_header" push origin "$backup"
+          git -c "http.https://github.com/.extraheader=$auth_header" push origin HEAD:refs/heads/main
           {
-            echo "## Safe upstream sync completed"
-            echo ""
-            echo "Upstream: $upstream_sha"
-            echo "Removed lines: $removed_lines; changed files: $files_changed"
-            echo "Backup: $backup"
-            echo "The custom sync workflow is preserved by the merge commit."
+            echo "## Verified candidate published"
+            echo "Backup branch: $backup"
+            echo "Pre-merge type checking, lint and tests passed."
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Pushes with GITHUB_TOKEN do not automatically trigger push CI;
+          # workflow_dispatch is an allowed exception. Its failing result
+          # is handled by restore-on-ci-failure.yml.
+          if ! gh workflow run ci.yml --ref main; then
+            echo "::warning::Could not dispatch full CI. Pre-publication tests passed; the AI review task should inspect this run."
+            echo "Full CI dispatch failed; inspect GitHub Actions." >> "$GITHUB_STEP_SUMMARY"
+          fi
