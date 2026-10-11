@@ -89,10 +89,12 @@ jobs:
           fi
 
           upstream_sha=$(git rev-parse upstream/main)
-          # On the initial run, start with the last upstream commit that
-          # the fork was verified against when this workflow was installed.
-          last_upstream=$(git log --first-parent --format=%P --grep='^chore(sync): merge morluto/rea main$' -1 HEAD | awk '{print $2}')
-          if [[ -z "$last_upstream" ]]; then
+          # Record the upstream commit represented by the most recent
+          # successful, non-workflow source sync. The initial fork was
+          # verified against this known upstream commit.
+          if [[ -f .rea-upstream-sha ]]; then
+            last_upstream=$(tr -d '\r\n' < .rea-upstream-sha)
+          else
             last_upstream="e90acaea674f5f7f9f17ea472104afdc1422ada6"
           fi
 
@@ -103,7 +105,7 @@ jobs:
             alert "Upstream history was rewritten, or the expected upstream commit disappeared. Refusing to force-sync."
           fi
 
-          if git merge-base --is-ancestor upstream/main HEAD; then
+          if [[ "$upstream_sha" == "$last_upstream" ]]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Already up to date with upstream ($upstream_sha)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -126,15 +128,25 @@ jobs:
             alert "Upstream contains whitespace/conflict marker errors. Manual review required."
           fi
 
-          # Preserve our custom workflow by MERGING upstream instead of
-          # making main point straight at upstream/main.
-          if ! git merge --no-ff --no-edit -m "chore(sync): merge morluto/rea main" upstream/main; then
-            git merge --abort || true
-            alert "Git merge conflict. The fork's main branch is unchanged."
+          # The default GITHUB_TOKEN cannot push incoming changes to
+          # .github/workflows/*. Keep all workflow/action definitions in
+          # our fork unchanged; update program source with a patch instead.
+          # Each successful update makes an ordinary reversible Git commit.
+          patch_file="$RUNNER_TEMP/rea-upstream-source.patch"
+          git diff --binary "$last_upstream" upstream/main -- . \
+            ':(exclude).github/workflows/**' \
+            ':(exclude).github/actions/**' > "$patch_file"
+
+          if [[ -s "$patch_file" ]]; then
+            if ! git apply --3way --index "$patch_file"; then
+              alert "Program-source patch conflicts with local modifications. Main has not been changed."
+            fi
           fi
+          printf '%s\n' "$upstream_sha" > .rea-upstream-sha
+          git add .rea-upstream-sha
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "Candidate merge prepared; tests must pass before publication." >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate source patch prepared; tests must pass before publication." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node.js for candidate validation
         if: steps.inspect.outputs.changed == 'true'
@@ -155,8 +167,10 @@ jobs:
           npm run test:prepare
           npm run check:fast
           npm run test:fast
+          # Candidate changes are staged intentionally; ensure tests and
+          # generators have not left unstaged modifications behind.
           git diff --exit-code
-          git diff --cached --exit-code
+          git diff --cached --check
 
       - name: Report candidate validation failure for automatic AI review
         if: ${{ failure() && steps.inspect.outputs.changed == 'true' }}
@@ -175,14 +189,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          before_merge=$(git rev-parse HEAD^1)
+          before_merge=$(git rev-parse HEAD)
+          upstream_sha=$(tr -d '\r\n' < .rea-upstream-sha)
+          git commit -m "chore(sync): update REA source from morluto/rea ($upstream_sha)"
           auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
           git -c "http.https://github.com/.extraheader=$auth_header" push origin HEAD:refs/heads/main
           {
-            echo "## Verified upstream merge published"
+            echo "## Verified upstream source sync published"
             echo "Previous commit: $before_merge (recoverable from Git history)"
-            echo "Full commit history retained; no extra per-sync backup branches."
+            echo "Reversible Git commit created; no per-sync backup branches."
             echo "Original 2026-10-11 backup branch was not touched."
+            echo "Upstream workflow/action config changes are excluded (GITHUB_TOKEN permission constraint)."
             echo "Pre-publication lint, typechecks and tests passed."
           } >> "$GITHUB_STEP_SUMMARY"
 
