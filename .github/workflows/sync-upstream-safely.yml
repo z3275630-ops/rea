@@ -65,7 +65,12 @@ jobs:
 
           # Freeze after an automatic CI rollback until the daily AI review
           # task investigates and resolves the GitHub issue.
-          rollback_issue_count=$(gh issue list --state open --limit 100 --json title --jq '[.[] | select(.title == "REA 自动回退：上游同步后 CI 失败")] | length')
+          if [[ -f .rea-sync-frozen ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "A previous CI regression froze upstream sync. Waiting for scheduled AI review." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          rollback_issue_count=$(gh issue list --state open --limit 100 --json title --jq '[.[] | select(.title == "REA 自动回退：上游同步后 CI 失败")] | length' 2>/dev/null || echo 0)
           if [[ "$rollback_issue_count" -gt 0 ]]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Sync frozen by an unresolved CI rollback. Waiting for scheduled AI review." >> "$GITHUB_STEP_SUMMARY"
