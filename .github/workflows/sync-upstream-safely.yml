@@ -145,6 +145,9 @@ jobs:
         run: |
           set -euo pipefail
           npm ci
+          # REA's tests require generated worker bundles and other build
+          # artifacts. Follow the project's own pretest preparation step.
+          npm run test:prepare
           npm run check:fast
           npm run test:fast
           git diff --exit-code
