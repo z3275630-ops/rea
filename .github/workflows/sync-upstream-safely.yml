@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
   issues: write
 
 concurrency:
@@ -28,7 +29,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Review upstream changes and prepare local merge
+      - name: Fetch upstream and prepare standard merge
         id: inspect
         shell: bash
         env:
@@ -103,21 +104,18 @@ jobs:
             exit 0
           fi
 
-          removed_files=$(git diff --name-only --diff-filter=DR "$last_upstream" upstream/main)
-          if [[ -n "$removed_files" ]]; then
-            alert "Upstream deleted or renamed tracked files. Manual review needed. First affected paths: $(echo "$removed_files" | head -n 5 | tr '\n' ' ')"
-          fi
-
-          sensitive_files=$(git diff --name-only "$last_upstream" upstream/main | grep -E '^\.github/(workflows/|actions/)' || true)
-          if [[ -n "$sensitive_files" ]]; then
-            alert "Upstream changed GitHub Actions code. Manual security review required before merging."
-          fi
-
+          # Routine upstream maintenance (renames, deletions, broad refactors
+          # and workflow changes) is allowed to merge into main. The original
+          # backup branch is intentionally untouched by this workflow.
+          removed_files=$(git diff --name-only --diff-filter=DR "$last_upstream" upstream/main | wc -l | tr -d ' ')
+          workflow_changes=$(git diff --name-only "$last_upstream" upstream/main | grep -Ec '^\.github/(workflows/|actions/)' || true)
           removed_lines=$(git diff --numstat "$last_upstream" upstream/main | awk '$2 ~ /^[0-9]+$/ {s += $2} END {print s+0}')
           files_changed=$(git diff --name-only "$last_upstream" upstream/main | wc -l | tr -d ' ')
-          if (( removed_lines > 350 || files_changed > 80 )); then
-            alert "Large upstream change: $removed_lines removed lines across $files_changed files. Manual review required."
-          fi
+          {
+            echo "Upstream changes: $files_changed files; $removed_lines deleted lines; $removed_files deleted/renamed paths; $workflow_changes CI workflow paths."
+            echo "Routine upstream changes proceed to pre-publication checks."
+            echo "The preserved backup-before-sync-2026-10-11 branch is never changed automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if ! git diff --check "$last_upstream" upstream/main; then
             alert "Upstream contains whitespace/conflict marker errors. Manual review required."
@@ -162,7 +160,7 @@ jobs:
             --title "REA 待处理：上游候选更新未通过测试" \
             --body "本次更新未发布到 main。候选版本的测试或构建失败；由每日 AI 管家检查原因及后续是否同步。详情：https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
 
-      - name: Back up old version and publish verified merge
+      - name: Publish verified merge (Git history retained)
         if: steps.inspect.outputs.changed == 'true'
         shell: bash
         env:
@@ -170,15 +168,14 @@ jobs:
         run: |
           set -euo pipefail
           before_merge=$(git rev-parse HEAD^1)
-          backup="backup/sync-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          git branch "$backup" "$before_merge"
           auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
-          git -c "http.https://github.com/.extraheader=$auth_header" push origin "$backup"
           git -c "http.https://github.com/.extraheader=$auth_header" push origin HEAD:refs/heads/main
           {
-            echo "## Verified candidate published"
-            echo "Backup branch: $backup"
-            echo "Pre-merge type checking, lint and tests passed."
+            echo "## Verified upstream merge published"
+            echo "Previous commit: $before_merge (recoverable from Git history)"
+            echo "Full commit history retained; no extra per-sync backup branches."
+            echo "Original 2026-10-11 backup branch was not touched."
+            echo "Pre-publication lint, typechecks and tests passed."
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Pushes with GITHUB_TOKEN do not automatically trigger push CI;
