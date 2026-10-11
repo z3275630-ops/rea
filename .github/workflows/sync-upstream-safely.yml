@@ -63,6 +63,15 @@ jobs:
             exit 1
           }
 
+          # Freeze after an automatic CI rollback until the daily AI review
+          # task investigates and resolves the GitHub issue.
+          rollback_issue_count=$(gh issue list --state open --limit 100 --json title --jq '[.[] | select(.title == "REA 自动回退：上游同步后 CI 失败")] | length')
+          if [[ "$rollback_issue_count" -gt 0 ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Sync frozen by an unresolved CI rollback. Waiting for scheduled AI review." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           git remote add upstream https://github.com/morluto/rea.git
           if ! git fetch --no-tags upstream main; then
             alert "Cannot fetch morluto/rea. The upstream repository may be deleted, private, or temporarily unavailable."
@@ -137,6 +146,16 @@ jobs:
           npm run test:fast
           git diff --exit-code
           git diff --cached --exit-code
+
+      - name: Report candidate validation failure for automatic AI review
+        if: ${{ failure() && steps.inspect.outputs.changed == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "REA 待处理：上游候选更新未通过测试" \
+            --body "本次更新未发布到 main。候选版本的测试或构建失败；由每日 AI 管家检查原因及后续是否同步。详情：https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
 
       - name: Back up old version and publish verified merge
         if: steps.inspect.outputs.changed == 'true'
