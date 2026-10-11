@@ -46,8 +46,15 @@ jobs:
           subject=$(git show -s --format=%s "$head_sha")
           parents=$(git show -s --format=%P "$head_sha")
           parent_count=$(wc -w <<< "$parents")
-          if [[ "$subject" != "chore(sync): merge morluto/rea main" || "$parent_count" -ne 2 ]]; then
-            echo "CI did not test the exact latest automated merge commit: no rollback." >> "$GITHUB_STEP_SUMMARY"
+          # Support both legacy two-parent merges and the new one-parent
+          # upstream-source sync commits (which intentionally exclude
+          # GitHub Actions workflow files to avoid extra token privileges).
+          if [[ "$subject" == "chore(sync): merge morluto/rea main" && "$parent_count" -eq 2 ]]; then
+            echo "revert_args=-m 1" >> "$GITHUB_OUTPUT"
+          elif [[ "$subject" == chore\(sync\):\ update\ REA\ source\ from\ morluto/rea\ \(* && "$parent_count" -eq 1 ]]; then
+            echo "revert_args=" >> "$GITHUB_OUTPUT"
+          else
+            echo "CI did not test the latest automated REA sync commit: no rollback." >> "$GITHUB_STEP_SUMMARY"
             echo "restore=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -69,8 +76,14 @@ jobs:
           failed_backup="backup/failed-ci-$GITHUB_RUN_ID"
           git branch "$failed_backup" "$failed_sha"
 
-          # Undo only this merge, preserving complete Git history.
-          git revert --no-edit -m 1 "$failed_sha"
+          # Undo only the latest sync, preserving complete Git history.
+          # A legacy two-parent merge requires -m 1; a newer one-parent
+          # source-update commit must be reverted without -m.
+          if [[ "${{ steps.verify.outputs.revert_args }}" == "-m 1" ]]; then
+            git revert --no-edit -m 1 "$failed_sha"
+          else
+            git revert --no-edit "$failed_sha"
+          fi
           if ! git diff --quiet "$first_parent" HEAD; then
             echo "::error::Reverted code does not match the pre-sync tree. Refusing to push."
             exit 1
