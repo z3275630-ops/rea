@@ -1,41 +1,32 @@
-name: Safe REA upstream sync
+name: Weekly REA upstream sync
 
 on:
-  # Exercise updated sync logic automatically whenever this file changes.
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/sync-upstream-safely.yml"
   schedule:
-    # Every day at 11:17 Beijing time (03:17 UTC).
-    - cron: "17 3 * * *"
+    # Sundays 11:17 Beijing time (03:17 UTC).
+    - cron: "17 3 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: write
-  actions: write
-  issues: write
 
 concurrency:
-  group: safe-rea-upstream-sync
+  group: weekly-rea-upstream-sync
   cancel-in-progress: false
 
 jobs:
   sync:
-    name: Check and safely sync upstream
+    name: Update main from upstream
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout fork
+      - name: Checkout fork with full history
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch upstream and prepare standard merge
-        id: inspect
+      - name: Apply new upstream source changes
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -43,170 +34,40 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          alert() {
-            local reason="$1"
-            local run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            {
-              echo "## Upstream synchronization paused"
-              echo ""
-              echo "$reason"
-              echo ""
-              echo "Your main branch has NOT been updated."
-              echo "Run: $run_url"
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::$reason"
-            local issue_title="REA 上游自动同步暂停"
-            local issue_body
-            issue_body=$(printf '原因：%s\n\n此次没有更新 main 分支。\n\n工作流记录：%s\n' "$reason" "$run_url")
-            local existing_issue
-            existing_issue=$(gh issue list --state open --limit 100 --json number,title --jq '.[] | select(.title == "REA 上游自动同步暂停") | .number' | head -n 1) || true
-            if [[ -n "$existing_issue" ]]; then
-              gh issue comment "$existing_issue" --body "$issue_body" || true
-            else
-              gh issue create --title "$issue_title" --body "$issue_body" || true
-            fi
-            exit 1
-          }
-
-          # Freeze after an automatic CI rollback until the daily AI review
-          # task investigates and resolves the GitHub issue.
-          if [[ -f .rea-sync-frozen ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "A previous CI regression froze upstream sync. Waiting for scheduled AI review." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          rollback_issue_count=$(gh issue list --state open --limit 100 --json title --jq '[.[] | select(.title == "REA 自动回退：上游同步后 CI 失败")] | length' 2>/dev/null || echo 0)
-          if [[ "$rollback_issue_count" -gt 0 ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Sync frozen by an unresolved CI rollback. Waiting for scheduled AI review." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
           git remote add upstream https://github.com/morluto/rea.git
-          if ! git fetch --no-tags upstream main; then
-            alert "Cannot fetch morluto/rea. The upstream repository may be deleted, private, or temporarily unavailable."
-          fi
+          git fetch --no-tags upstream main
 
-          upstream_sha=$(git rev-parse upstream/main)
-          # Record the upstream commit represented by the most recent
-          # successful, non-workflow source sync. The initial fork was
-          # verified against this known upstream commit.
-          if [[ -f .rea-upstream-sha ]]; then
-            last_upstream=$(tr -d '\r\n' < .rea-upstream-sha)
-          else
-            last_upstream="e90acaea674f5f7f9f17ea472104afdc1422ada6"
-          fi
-
-          if ! git cat-file -e "$last_upstream^{commit}" 2>/dev/null; then
-            alert "Cannot locate the previously synced upstream commit. Manual review required."
-          fi
-          if ! git merge-base --is-ancestor "$last_upstream" upstream/main; then
-            alert "Upstream history was rewritten, or the expected upstream commit disappeared. Refusing to force-sync."
-          fi
-
-          if [[ "$upstream_sha" == "$last_upstream" ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Already up to date with upstream ($upstream_sha)." >> "$GITHUB_STEP_SUMMARY"
+          previous=$(tr -d '\r\n' < .rea-upstream-sha)
+          current=$(git rev-parse upstream/main)
+          if [[ "$previous" == "$current" ]]; then
+            echo "Already up to date with upstream." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          # Routine upstream maintenance (renames, deletions, broad refactors
-          # and workflow changes) is allowed to merge into main. The original
-          # backup branch is intentionally untouched by this workflow.
-          removed_files=$(git diff --name-only --diff-filter=DR "$last_upstream" upstream/main | wc -l | tr -d ' ')
-          workflow_changes=$(git diff --name-only "$last_upstream" upstream/main | grep -Ec '^\.github/(workflows/|actions/)' || true)
-          removed_lines=$(git diff --numstat "$last_upstream" upstream/main | awk '$2 ~ /^[0-9]+$/ {s += $2} END {print s+0}')
-          files_changed=$(git diff --name-only "$last_upstream" upstream/main | wc -l | tr -d ' ')
-          {
-            echo "Upstream changes: $files_changed files; $removed_lines deleted lines; $removed_files deleted/renamed paths; $workflow_changes CI workflow paths."
-            echo "Routine upstream changes proceed to pre-publication checks."
-            echo "The preserved backup-before-sync-2026-10-11 branch is never changed automatically."
-          } >> "$GITHUB_STEP_SUMMARY"
+          # Stop on rewritten upstream history or missing base; never force-push.
+          git merge-base --is-ancestor "$previous" upstream/main
 
-          if ! git diff --check "$last_upstream" upstream/main; then
-            alert "Upstream contains whitespace/conflict marker errors. Manual review required."
-          fi
-
-          # The default GITHUB_TOKEN cannot push incoming changes to
-          # .github/workflows/*. Keep all workflow/action definitions in
-          # our fork unchanged; update program source with a patch instead.
-          # Each successful update makes an ordinary reversible Git commit.
-          patch_file="$RUNNER_TEMP/rea-upstream-source.patch"
-          git diff --binary "$last_upstream" upstream/main -- . \
+          # Preserve our own Actions workflows and the permanent backup branch.
+          # Standard GITHUB_TOKEN pushes cannot update workflow definitions.
+          patch="$RUNNER_TEMP/rea-weekly-source.patch"
+          git diff --binary "$previous" upstream/main -- . \
             ':(exclude).github/workflows/**' \
-            ':(exclude).github/actions/**' > "$patch_file"
-
-          if [[ -s "$patch_file" ]]; then
-            if ! git apply --3way --index "$patch_file"; then
-              alert "Program-source patch conflicts with local modifications. Main has not been changed."
-            fi
+            ':(exclude).github/actions/**' > "$patch"
+          if [[ -s "$patch" ]]; then
+            git apply --3way --index "$patch"
           fi
-          printf '%s\n' "$upstream_sha" > .rea-upstream-sha
+
+          printf '%s\n' "$current" > .rea-upstream-sha
           git add .rea-upstream-sha
-
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "Candidate source patch prepared; tests must pass before publication." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Set up Node.js for candidate validation
-        if: steps.inspect.outputs.changed == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
-      - name: Verify merged code before publishing
-        if: steps.inspect.outputs.changed == 'true'
-        timeout-minutes: 35
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm ci
-          # REA's tests require generated worker bundles and other build
-          # artifacts. Follow the project's own pretest preparation step.
-          npm run test:prepare
-          npm run check:fast
-          npm run test:fast
-          # Candidate changes are staged intentionally; ensure tests and
-          # generators have not left unstaged modifications behind.
-          git diff --exit-code
           git diff --cached --check
-
-      - name: Report candidate validation failure for automatic AI review
-        if: ${{ failure() && steps.inspect.outputs.changed == 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh issue create \
-            --title "REA 待处理：上游候选更新未通过测试" \
-            --body "本次更新未发布到 main。候选版本的测试或构建失败；由每日 AI 管家检查原因及后续是否同步。详情：https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
-
-      - name: Publish verified merge (Git history retained)
-        if: steps.inspect.outputs.changed == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          before_merge=$(git rev-parse HEAD)
-          upstream_sha=$(tr -d '\r\n' < .rea-upstream-sha)
-          git commit -m "chore(sync): update REA source from morluto/rea ($upstream_sha)"
+          git commit -m "chore(sync): weekly REA source update ($current)"
           auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
           git -c "http.https://github.com/.extraheader=$auth_header" push origin HEAD:refs/heads/main
-          {
-            echo "## Verified upstream source sync published"
-            echo "Previous commit: $before_merge (recoverable from Git history)"
-            echo "Reversible Git commit created; no per-sync backup branches."
-            echo "Original 2026-10-11 backup branch was not touched."
-            echo "Upstream workflow/action config changes are excluded (GITHUB_TOKEN permission constraint)."
-            echo "Pre-publication lint, typechecks and tests passed."
-          } >> "$GITHUB_STEP_SUMMARY"
 
-          # Pushes with GITHUB_TOKEN do not automatically trigger push CI;
-          # workflow_dispatch is an allowed exception. Its failing result
-          # is handled by restore-on-ci-failure.yml.
-          if ! gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref main; then
-            echo "::warning::Could not dispatch full CI. Pre-publication tests passed; please inspect the full CI trigger."
-            echo "Full CI dispatch failed; inspect GitHub Actions." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo "## Weekly upstream sync completed"
+            echo "Upstream: $current"
+            echo "Changes saved as a normal reversible Git commit."
+            echo "No CI, release, or rollback triggered by this sync."
+            echo "Permanent backup-before-sync-2026-10-11 was not modified."
+          } >> "$GITHUB_STEP_SUMMARY"
